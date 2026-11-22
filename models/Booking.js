@@ -6,6 +6,7 @@ const orderSchema = new mongoose.Schema({
   price: Number,
   quantity: Number,
   delivered: Boolean,
+  instructions: String,   // spice level / customer note for the kitchen
   orderedAt: Date
 });
 

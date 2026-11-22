@@ -15,6 +15,8 @@ import Bill from "./models/Bill.js";
 
 dotenv.config();
 
+
+
 const app = express();
 const port = process.env.PORT || 1000;
 
@@ -28,9 +30,16 @@ app.use(express.urlencoded({ extended: true }));
 /* =================================
   ✅ DATABASE CONNECTION
 ================================= */
-mongoose.connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 15000 })
   .then(() => console.log("✅ MongoDB Connected"))
   .catch(err => console.log("❌ MongoDB Error:", err.message));
+
+mongoose.connection.on("disconnected", () =>
+  console.log("⚠️ MongoDB disconnected")
+);
+mongoose.connection.on("reconnected", () =>
+  console.log("✅ MongoDB reconnected")
+);
 
 /* =================================
   ✅ CLOUDINARY CONFIG
@@ -52,6 +61,18 @@ const upload = multer({ dest: "uploads/" });
 app.get("/", (req, res) => {
   res.json({ message: "🔥 Server running successfully..." });
 });
+
+/* =================================
+  ✅ SHARED HELPERS
+================================= */
+
+// Build kitchen instructions (spice level + note) for an order item
+const buildInstructions = (spiceLevel, description) => {
+  const parts = [];
+  if (spiceLevel) parts.push(`Spice: ${spiceLevel}`);
+  if (description) parts.push(`Note: ${description}`);
+  return parts.join(" | ");
+};
 
 /* =================================
   ✅ HOTEL ROUTES
@@ -212,10 +233,48 @@ app.get("/api/hotels/:id", async (req, res) => {
 // UPDATE HOTEL
 app.put("/api/hotel/:id", upload.single("hotelImage"), async (req, res) => {
   try {
+
+    const hotel = await Hotel.findById(req.params.id);
+
+    if (!hotel) {
+      return res.status(404).json({ success: false, message: "Hotel not found" });
+    }
+
     const updateData = { ...req.body };
 
+    // Never allow password change through this endpoint
+    delete updateData.password;
+
+    if (updateData.email) {
+      updateData.email = String(updateData.email).toLowerCase();
+
+      if (updateData.email !== hotel.email) {
+        const existing = await Hotel.findOne({ email: updateData.email });
+        if (existing) {
+          return res.status(400).json({ success: false, message: "Email already registered" });
+        }
+      }
+    }
+
     if (updateData.sections) {
-      updateData.sections = JSON.parse(updateData.sections);
+      try {
+        updateData.sections =
+          typeof updateData.sections === "string"
+            ? JSON.parse(updateData.sections)
+            : updateData.sections;
+      } catch (parseError) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid sections format"
+        });
+      }
+    }
+
+    // Ignore plain-string image values (e.g. base64 data URLs sent by mistake)
+    if (typeof updateData.hotelImage === "string" && !updateData.hotelImage.startsWith("data:")) {
+      delete updateData.hotelImage;
+    } else if (updateData.hotelImage) {
+      delete updateData.hotelImage; // image must come through multipart file
     }
 
     if (req.file) {
@@ -224,13 +283,16 @@ app.put("/api/hotel/:id", upload.single("hotelImage"), async (req, res) => {
       fs.unlinkSync(req.file.path);
     }
 
-    const updatedHotel = await Hotel.findByIdAndUpdate(
-      req.params.id,
-      updateData,
-      { new: true }
-    ).select("-password");
+    Object.keys(updateData).forEach(key => {
+      hotel[key] = updateData[key];
+    });
 
-    res.json({ success: true, data: updatedHotel });
+    const updatedHotel = await hotel.save();
+
+    const data = updatedHotel.toObject();
+    delete data.password;
+
+    res.json({ success: true, data });
 
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -250,6 +312,10 @@ app.post("/api/food", upload.single("image"), async (req, res) => {
       return res.status(400).json({ success: false, message: "Image & Hotel ID required" });
     }
 
+    if (!title || !desc || !price || Number(price) < 0) {
+      return res.status(400).json({ success: false, message: "Title, description & valid price required" });
+    }
+
     const uploadResult = await cloudinary.uploader.upload(req.file.path, { folder: "foods" });
     fs.unlinkSync(req.file.path);
 
@@ -258,13 +324,51 @@ app.post("/api/food", upload.single("image"), async (req, res) => {
       image: uploadResult.secure_url,
       title,
       desc,
-      price,
+      price: Number(price),
       foodCategory,
       category,
-      available,
+      available: String(available) !== "false",
     });
 
     res.status(201).json({ success: true, data: newFood });
+
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// UPDATE FOOD (image optional — keeps existing image if none uploaded)
+app.put("/api/food/:id", upload.single("image"), async (req, res) => {
+  try {
+
+    const food = await Food.findById(req.params.id);
+
+    if (!food) {
+      return res.status(404).json({ success: false, message: "Food not found" });
+    }
+
+    const { title, desc, price, foodCategory, category, available } = req.body;
+
+    if (price !== undefined && Number(price) < 0) {
+      return res.status(400).json({ success: false, message: "Price cannot be negative" });
+    }
+
+    if (title !== undefined) food.title = title;
+    if (desc !== undefined) food.desc = desc;
+    if (price !== undefined) food.price = Number(price);
+    if (foodCategory !== undefined) food.foodCategory = foodCategory;
+    if (category !== undefined) food.category = category;
+    if (available !== undefined) food.available = available === "true" || available === true;
+
+    if (req.file) {
+      const uploadResult = await cloudinary.uploader.upload(req.file.path, { folder: "foods" });
+      fs.unlinkSync(req.file.path);
+      food.image = uploadResult.secure_url;
+    }
+
+    await food.save();
+
+    res.json({ success: true, data: food });
 
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -284,7 +388,12 @@ app.get("/api/food/hotel/:hotelId", async (req, res) => {
 // DELETE FOOD
 app.delete("/api/food/:id", async (req, res) => {
   try {
-    await Food.findByIdAndDelete(req.params.id);
+    const food = await Food.findByIdAndDelete(req.params.id);
+
+    if (!food) {
+      return res.status(404).json({ success: false, message: "Food not found" });
+    }
+
     res.json({ success: true, message: "Food deleted" });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -320,7 +429,7 @@ app.put("/api/food/:id/toggle", async (req, res) => {
 app.post("/api/bookings/place-order", async (req, res) => {
   try {
 
-    const { hotelId, tableNumber, orderType, items } = req.body;
+    const { hotelId, tableNumber, orderType, items, spiceLevel, description } = req.body;
 
     if (!hotelId || !tableNumber || !items?.length) {
       return res.status(400).json({
@@ -374,10 +483,14 @@ app.post("/api/bookings/place-order", async (req, res) => {
     }
 
     // ✅ ADD ITEMS
+    const instructions = buildInstructions(spiceLevel, description);
+
     items.forEach(item => {
 
       const price = Number(item.price);
       const qty = Number(item.quantity);
+
+      if (!item.title || !Number.isFinite(price) || !Number.isFinite(qty) || qty < 1) return;
 
       booking.orders.push({
         foodId: item.foodId,
@@ -385,12 +498,20 @@ app.post("/api/bookings/place-order", async (req, res) => {
         price: price,
         quantity: qty,
         delivered: false,
+        instructions,
         orderedAt: new Date()
       });
 
       booking.totalAmount += price * qty;
 
     });
+
+    if (booking.orders.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid items in order"
+      });
+    }
 
     await booking.save();
 
@@ -479,6 +600,28 @@ app.get("/api/bookings/kot/:hotelId", async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ success: false });
+  }
+});
+
+// GET ALL ACTIVE BOOKINGS FOR HOTEL (used by customer menu "Your Orders")
+app.get("/api/bookings/:hotelId", async (req, res) => {
+  try {
+
+    const bookings = await Booking.find({
+      hotelId: req.params.hotelId,
+      status: "active"
+    }).sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      data: bookings
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
   }
 });
 
@@ -662,7 +805,28 @@ app.post("/api/bookings/manual-add", async (req, res) => {
 
     const { hotelId, tableNumber, roomNumber, orderType, items } = req.body;
 
+    if (!hotelId || !orderType || !items?.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing data"
+      });
+    }
+
+    if (orderType !== "room" && orderType !== "table") {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid order type"
+      });
+    }
+
     const number = orderType === "room" ? roomNumber : tableNumber;
+
+    if (!number) {
+      return res.status(400).json({
+        success: false,
+        message: orderType === "room" ? "Room number required" : "Table number required"
+      });
+    }
 
     let booking = await Booking.findOne({
       hotelId,
@@ -692,19 +856,28 @@ app.post("/api/bookings/manual-add", async (req, res) => {
 
       const price = Number(item.price) || 0;
       const qty = Number(item.quantity) || 0;
-      
+
+      if (!item.title || qty < 1) return;
+
       booking.orders.push({
-      foodId: item.foodId,
-      title: item.title,
-      price: price,
-      quantity: qty,
-      delivered: false,
-      orderedAt: new Date()
+        foodId: item.foodId,
+        title: item.title,
+        price: price,
+        quantity: qty,
+        delivered: false,
+        orderedAt: new Date()
       });
-      
+
       booking.totalAmount = Number(booking.totalAmount || 0) + (price * qty);
-      
+
+    });
+
+    if (booking.orders.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No valid items to add"
       });
+    }
 
     await booking.save();
 
@@ -819,6 +992,10 @@ app.post("/api/orders/complete-table", async (req, res) => {
 
     const { hotelId, tableNumber, paymentMethod } = req.body;
 
+    if (!hotelId || !tableNumber) {
+      return res.status(400).json({ success: false, message: "Missing data" });
+    }
+
     const bookings = await Booking.find({
       hotelId,
       number: tableNumber,
@@ -839,11 +1016,13 @@ app.post("/api/orders/complete-table", async (req, res) => {
       subtotal += item.price * item.quantity;
     });
 
-    const gst = subtotal * 0.05;
-    const totalAmount = subtotal + gst;
+    const gst = Number((subtotal * 0.05).toFixed(2));
+    const totalAmount = Number((subtotal + gst).toFixed(2));
 
     // generate bill number
     const billNo = "BILL-" + Date.now();
+
+    const validPayments = ["cash", "upi", "card"];
 
     const order = await Order.create({
 
@@ -860,7 +1039,7 @@ app.post("/api/orders/complete-table", async (req, res) => {
       subtotal,
       gst,
       totalAmount,
-      paymentMethod
+      paymentMethod: validPayments.includes(paymentMethod) ? paymentMethod : "cash"
 
     });
 
@@ -890,16 +1069,25 @@ app.post("/api/orders/complete-table", async (req, res) => {
 
 app.get("/api/rooms/hotel/:hotelId", async (req, res) => {
 
-  const bookings = await Booking.find({
-    hotelId: req.params.hotelId,
-    orderType: "room",
-    status: "active"
-  }).sort({ createdAt: -1 });
+  try {
 
-  res.json({
-    success: true,
-    data: bookings
-  });
+    const bookings = await Booking.find({
+      hotelId: req.params.hotelId,
+      orderType: "room",
+      status: "active"
+    }).sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      data: bookings
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
 
 });
 
@@ -909,6 +1097,23 @@ app.post("/api/bookings/room-login", async (req, res) => {
 
   try {
 
+    if (!hotelId || !roomNumber) {
+      return res.json({ success: false, message: "Missing data" });
+    }
+
+    // ✅ Prevent double check-in for the same room
+    const existing = await Booking.findOne({
+      hotelId,
+      number: roomNumber,
+      orderType: "room",
+      status: "active",
+      checkInTime: { $exists: true, $ne: null }
+    });
+
+    if (existing) {
+      return res.json({ success: false, message: "Room already checked in" });
+    }
+
     const room = new Booking({
 
       hotelId,
@@ -916,15 +1121,15 @@ app.post("/api/bookings/room-login", async (req, res) => {
       customerName,
       age,
       personCount,
-    
+
       orderType: "room",
       status: "active",
-    
-      orders: [],        
-      totalAmount: 0,      
-    
+
+      orders: [],
+      totalAmount: 0,
+
       checkInTime: new Date()
-    
+
     });
 
     await room.save();
@@ -932,7 +1137,7 @@ app.post("/api/bookings/room-login", async (req, res) => {
     res.json({ success: true, data: room });
 
   } catch (err) {
-    res.json({ success: false });
+    res.json({ success: false, message: err.message });
   }
 
 });
@@ -952,10 +1157,14 @@ app.post("/api/bookings/room-checkout", async (req, res) => {
     });
 
     if (bookings.length === 0) {
-      return res.json({ success: false });
+      return res.json({ success: false, message: "Room not logged in" });
     }
 
     const loginBooking = bookings.find(b => b.checkInTime);
+
+    if (!loginBooking) {
+      return res.json({ success: false, message: "Room check-in information missing" });
+    }
 
     const checkoutTime = new Date();
     const checkInTime = new Date(loginBooking.checkInTime);
@@ -1037,7 +1246,11 @@ app.post("/api/bookings/generate-room-bill", async (req, res) => {
     });
 
     if (!booking) {
-      return res.json({ success: false });
+      return res.json({ success: false, message: "Room not logged in" });
+    }
+
+    if (!booking.checkInTime) {
+      return res.json({ success: false, message: "Room check-in information missing" });
     }
 
     const checkoutTime = new Date();
@@ -1160,6 +1373,24 @@ app.put("/api/bookings/shift-to-room", async (req, res) => {
     console.error(err);
     res.json({ success: false });
   }
+});
+
+/* =================================
+  ✅ 404 + ERROR HANDLERS (API)
+================================= */
+app.use((req, res, next) => {
+  res.status(404).json({
+    success: false,
+    message: `Route not found: ${req.method} ${req.originalUrl}`
+  });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Unhandled Error:", err.message);
+  res.status(500).json({
+    success: false,
+    message: err.message || "Internal server error"
+  });
 });
 
 /* =================================
